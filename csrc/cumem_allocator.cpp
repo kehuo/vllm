@@ -1,6 +1,7 @@
 // A CUDAPluggableAllocator based on cumem* APIs.
 // Important: allocation size, CUdeviceptr and CUmemGenericAllocationHandle*
 // need to be unsigned long long
+#include <atomic>
 #include <iostream>
 
 #include "cumem_allocator_compat.h"
@@ -98,17 +99,18 @@ void ensure_context(unsigned long long device) {
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12040
 // Per-device cache: 0 = not probed, 1 = supported, 2 = not supported
 static constexpr int MAX_DEVICES = 32;
-static int fabric_support[MAX_DEVICES] = {0};
+static std::atomic<int> fabric_support[MAX_DEVICES] = {};
 
 static bool probe_fabric_support(unsigned long long device) {
   if (device >= MAX_DEVICES) return false;
-  if (fabric_support[device] != 0) return fabric_support[device] == 1;
+  int cached = fabric_support[device].load(std::memory_order_acquire);
+  if (cached != 0) return cached == 1;
 
   int fab_flag = 0;
   CUresult r = cuDeviceGetAttribute(
       &fab_flag, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device);
   if (r != CUDA_SUCCESS || !fab_flag) {
-    fabric_support[device] = 2;
+    fabric_support[device].store(2, std::memory_order_release);
     return false;
   }
 
@@ -125,7 +127,7 @@ static bool probe_fabric_support(unsigned long long device) {
   r = cuMemGetAllocationGranularity(
       &granularity, &probe_prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
   if (r != CUDA_SUCCESS) {
-    fabric_support[device] = 2;
+    fabric_support[device].store(2, std::memory_order_release);
     return false;
   }
 
@@ -133,11 +135,11 @@ static bool probe_fabric_support(unsigned long long device) {
   r = cuMemCreate(&test_handle, granularity, &probe_prop, 0);
   if (r == CUDA_SUCCESS) {
     cuMemRelease(test_handle);
-    fabric_support[device] = 1;
+    fabric_support[device].store(1, std::memory_order_release);
     return true;
   }
 
-  fabric_support[device] = 2;
+  fabric_support[device].store(2, std::memory_order_release);
   return false;
 }
 #endif
@@ -186,10 +188,10 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 12040
     // Safety net: if fabric was probed as available but this allocation
     // still fails, fall back to POSIX FD and update the cache.
-    if (fabric_support[device] == 1 &&
+    if (fabric_support[device].load(std::memory_order_acquire) == 1 &&
         (ret == CUDA_ERROR_NOT_PERMITTED ||
          ret == CUDA_ERROR_NOT_SUPPORTED)) {
-      fabric_support[device] = 2;
+      fabric_support[device].store(2, std::memory_order_release);
       prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
       CUDA_CHECK(cuMemCreate(p_memHandle, size, &prop, 0));
     } else {
@@ -362,7 +364,8 @@ void* my_malloc(ssize_t size, int device, CUstream stream) {
   // first allocation, align the size, and reserve an address, and also allocate
   // a CUmemGenericAllocationHandle
 
-  // Define memory allocation properties
+  // No fabric/POSIX handle requested here — this path is for weight loading
+  // (sleep mode), not KV cache; create_and_map handles KV handle types.
   CUmemAllocationProp prop = {};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;

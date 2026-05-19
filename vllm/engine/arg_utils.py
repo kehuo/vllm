@@ -838,7 +838,7 @@ class EngineArgs:
             "--enable-sleep-mode", **model_kwargs["enable_sleep_mode"]
         )
         model_group.add_argument(
-            "--enable-cumem-allocator",
+            "--enable-cumem-kv-cache",
             **model_kwargs["enable_cumem_kv_cache"],
         )
         model_group.add_argument("--model-impl", **model_kwargs["model_impl"])
